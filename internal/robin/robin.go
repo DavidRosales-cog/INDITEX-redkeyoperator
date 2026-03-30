@@ -563,7 +563,7 @@ func (r *Robin) doWithRetry(ctx context.Context, fn func() ([]byte, error)) ([]b
 		return false, nil
 	})
 	if err != nil {
-		if lastErr != nil {
+		if wait.Interrupted(err) && lastErr != nil {
 			return nil, lastErr
 		}
 		return nil, err
@@ -601,7 +601,7 @@ func (r *Robin) doWithRetryNetworkOnly(ctx context.Context, fn func() ([]byte, e
 		return false, nil
 	})
 	if err != nil {
-		if lastErr != nil {
+		if wait.Interrupted(err) && lastErr != nil {
 			return nil, lastErr
 		}
 		return nil, err
