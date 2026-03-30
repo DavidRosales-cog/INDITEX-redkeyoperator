@@ -28,6 +28,7 @@ import (
 
 	redkeyv1 "github.com/inditextech/redkeyoperator/api/v1"
 	finalizer "github.com/inditextech/redkeyoperator/internal/finalizers"
+	"github.com/inditextech/redkeyoperator/internal/robin"
 )
 
 // RedkeyClusterReconciler reconciles a RedkeyCluster object
@@ -44,6 +45,7 @@ type RedkeyClusterReconciler struct {
 	FindExistingConfigMapFunc           func(ctx context.Context, req ctrl.Request) (*corev1.ConfigMap, error)
 	FindExistingDeploymentFunc          func(ctx context.Context, req ctrl.Request) (*v1.Deployment, error)
 	FindExistingPodDisruptionBudgetFunc func(ctx context.Context, req ctrl.Request) (*pv1.PodDisruptionBudget, error)
+	NewRobinFunc                        func(ctx context.Context, client client.Client, redkeyCluster *redkeyv1.RedkeyCluster, logger logr.Logger) (robin.RobinClient, error)
 }
 
 // +kubebuilder:rbac:groups=redkey.inditex.dev,resources=redkeyclusters,verbs=get;list;watch;create;update;patch;delete

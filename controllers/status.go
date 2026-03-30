@@ -60,13 +60,13 @@ func (r *RedkeyClusterReconciler) updateClusterStatus(ctx context.Context, redke
 		// time to be ready to accept API requests.
 		if redkeyCluster.Status.Status != redkeyv1.StatusInitializing && redkeyCluster.Spec.Primaries > 0 {
 			logger := r.getHelperLogger(redkeyCluster.NamespacedName())
-			robin, err := robin.NewRobin(ctx, r.Client, redkeyCluster, logger)
+			robinClient, err := r.NewRobinFunc(ctx, r.Client, redkeyCluster, logger)
 			if err != nil {
 				r.logError(redkeyCluster.NamespacedName(), err, "Error getting Robin to update the status")
 				return err
 			}
 
-			err = robin.SetStatus(redkeyv1.GetRobinStatusCodeEquivalence(redkeyCluster.Status.Status))
+			err = robinClient.SetStatus(ctx, redkeyv1.GetRobinStatusCodeEquivalence(redkeyCluster.Status.Status))
 			if err != nil {
 				r.logError(redkeyCluster.NamespacedName(), err, "Error setting the new status to Robin", "status", redkeyCluster.Status.Status)
 				return err
