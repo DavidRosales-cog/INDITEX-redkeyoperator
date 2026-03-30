@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	ctrlClient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -53,6 +55,59 @@ const (
 	EndpointClusterRecreate = "/v1/cluster/recreate"
 	EndpointClusterStatus   = "/v1/cluster/status"
 )
+
+// RobinClient is the interface that captures all public methods on the Robin struct.
+type RobinClient interface {
+	GetStatus(ctx context.Context) (string, error)
+	SetStatus(ctx context.Context, status string) error
+	SetAndPersistRobinStatus(ctx context.Context, client ctrlClient.Client, redkeyCluster *redkeyv1.RedkeyCluster, newStatus string) error
+	GetReplicas(ctx context.Context) (int, int, error)
+	SetReplicas(ctx context.Context, clusterReplicas int, clusterReplicasPerPrimary int) error
+	ClusterCheck(ctx context.Context) (bool, []string, []string, error)
+	GetClusterNodes(ctx context.Context) (ClusterNodes, error)
+	ClusterFix(ctx context.Context) error
+	ClusterResetNode(ctx context.Context, nodeIndex int) error
+	MoveSlots(ctx context.Context, nodeIndexFrom int, nodeIndexTo int, numSlots int) (bool, error)
+	ClusterRecreate(ctx context.Context) error
+	GetClusterStatus(ctx context.Context) (string, error)
+	GetPod() *corev1.Pod
+}
+
+// RobinHTTPError represents a non-2xx HTTP response from Robin.
+type RobinHTTPError struct {
+	StatusCode int
+	Body       string
+	URL        string
+}
+
+func (e *RobinHTTPError) Error() string {
+	return fmt.Sprintf("robin HTTP error: status %d from %s: %s", e.StatusCode, e.URL, e.Body)
+}
+
+// IsRetryable returns true if the error is retryable.
+func IsRetryable(err error) bool {
+	var httpErr *RobinHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode >= 500
+	}
+	return true // network errors are retryable
+}
+
+// RobinClientConfig holds configuration for the Robin HTTP client.
+type RobinClientConfig struct {
+	HTTPTimeout  time.Duration
+	MaxRetries   int
+	RetryBackoff time.Duration
+}
+
+// DefaultRobinClientConfig returns a RobinClientConfig with sensible defaults.
+func DefaultRobinClientConfig() RobinClientConfig {
+	return RobinClientConfig{
+		HTTPTimeout:  30 * time.Second,
+		MaxRetries:   3,
+		RetryBackoff: 500 * time.Millisecond,
+	}
+}
 
 // Configuration is the top-level configuration struct.
 type Configuration struct {
@@ -140,12 +195,19 @@ type MoveSlotsStatus struct {
 }
 
 type Robin struct {
-	Pod    *corev1.Pod
-	Logger logr.Logger
+	Pod        *corev1.Pod
+	Logger     logr.Logger
+	httpClient *http.Client
+	config     RobinClientConfig
 }
 
-// Gets Robin initialized from a RedkeyCluster.
-func NewRobin(ctx context.Context, client ctrlClient.Client, redkeyCluster *redkeyv1.RedkeyCluster, logger logr.Logger) (Robin, error) {
+// NewRobin gets Robin initialized from a RedkeyCluster using default configuration.
+func NewRobin(ctx context.Context, client ctrlClient.Client, redkeyCluster *redkeyv1.RedkeyCluster, logger logr.Logger) (RobinClient, error) {
+	return NewRobinWithConfig(ctx, client, redkeyCluster, logger, DefaultRobinClientConfig())
+}
+
+// NewRobinWithConfig creates a Robin with the given configuration.
+func NewRobinWithConfig(ctx context.Context, client ctrlClient.Client, redkeyCluster *redkeyv1.RedkeyCluster, logger logr.Logger, cfg RobinClientConfig) (RobinClient, error) {
 	componentLabel := kubernetes.GetStatefulSetSelectorLabel(ctx, client, redkeyCluster)
 	labelSelector := labels.SelectorFromSet(
 		map[string]string{
@@ -154,8 +216,17 @@ func NewRobin(ctx context.Context, client ctrlClient.Client, redkeyCluster *redk
 		},
 	)
 
-	robin := Robin{}
+	robin := &Robin{}
 	robin.Logger = logger
+	robin.config = cfg
+	robin.httpClient = &http.Client{
+		Timeout: cfg.HTTPTimeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 
 	pods := &corev1.PodList{}
 	err := client.List(ctx, pods, &ctrlClient.ListOptions{
@@ -178,10 +249,17 @@ func NewRobin(ctx context.Context, client ctrlClient.Client, redkeyCluster *redk
 	return robin, nil
 }
 
-func (r *Robin) GetStatus() (string, error) {
+// GetPod returns the Pod associated with this Robin instance.
+func (r *Robin) GetPod() *corev1.Pod {
+	return r.Pod
+}
+
+func (r *Robin) GetStatus(ctx context.Context) (string, error) {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointStatus
 
-	body, err := doSimpleGet(url)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doGet(ctx, url)
+	})
 	if err != nil {
 		return "", fmt.Errorf("getting Robin status: %w", err)
 	}
@@ -195,7 +273,7 @@ func (r *Robin) GetStatus() (string, error) {
 	return status.Status, nil
 }
 
-func (r *Robin) SetStatus(status string) error {
+func (r *Robin) SetStatus(ctx context.Context, status string) error {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointStatus
 
 	var statusParam Status
@@ -205,7 +283,9 @@ func (r *Robin) SetStatus(status string) error {
 		return fmt.Errorf("setting Robin status: %w", err)
 	}
 
-	body, err := doPut(url, payload)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doPut(ctx, url, payload)
+	})
 	if err != nil {
 		return fmt.Errorf("setting Robin status: %w", err)
 	}
@@ -215,17 +295,19 @@ func (r *Robin) SetStatus(status string) error {
 }
 
 func (r *Robin) SetAndPersistRobinStatus(ctx context.Context, client ctrlClient.Client, redkeyCluster *redkeyv1.RedkeyCluster, newStatus string) error {
-	err := r.SetStatus(newStatus)
+	err := r.SetStatus(ctx, newStatus)
 	if err != nil {
 		return err
 	}
 	return PersistRobinStatus(ctx, client, redkeyCluster, newStatus)
 }
 
-func (r *Robin) GetReplicas() (int, int, error) {
+func (r *Robin) GetReplicas(ctx context.Context) (int, int, error) {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointReplicas
 
-	body, err := doSimpleGet(url)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doGet(ctx, url)
+	})
 	if err != nil {
 		return 0, 0, fmt.Errorf("getting Robin status: %w", err)
 	}
@@ -239,7 +321,7 @@ func (r *Robin) GetReplicas() (int, int, error) {
 	return clusterReplicas.Primaries, clusterReplicas.ReplicasPerPrimary, nil
 }
 
-func (r *Robin) SetReplicas(clusterReplicas int, clusterReplicasPerPrimary int) error {
+func (r *Robin) SetReplicas(ctx context.Context, clusterReplicas int, clusterReplicasPerPrimary int) error {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointReplicas
 
 	var replicas ClusterReplicas
@@ -250,7 +332,9 @@ func (r *Robin) SetReplicas(clusterReplicas int, clusterReplicasPerPrimary int) 
 		return fmt.Errorf("setting Robin status: %w", err)
 	}
 
-	body, err := doPut(url, payload)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doPut(ctx, url, payload)
+	})
 	if err != nil {
 		return fmt.Errorf("setting Robin status: %w", err)
 	}
@@ -259,10 +343,12 @@ func (r *Robin) SetReplicas(clusterReplicas int, clusterReplicasPerPrimary int) 
 	return nil
 }
 
-func (r *Robin) ClusterCheck() (bool, []string, []string, error) {
+func (r *Robin) ClusterCheck(ctx context.Context) (bool, []string, []string, error) {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointClusterCheck
 
-	body, err := doSimpleGet(url)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doGet(ctx, url)
+	})
 	if err != nil {
 		return false, nil, nil, fmt.Errorf("getting Robin status: %w", err)
 	}
@@ -280,11 +366,13 @@ func (r *Robin) ClusterCheck() (bool, []string, []string, error) {
 	return checkResult, clusterCheck.Errors, clusterCheck.Warnings, nil
 }
 
-func (r *Robin) GetClusterNodes() (ClusterNodes, error) {
+func (r *Robin) GetClusterNodes(ctx context.Context) (ClusterNodes, error) {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointClusterNodes
 	var clusterNodes ClusterNodes
 
-	body, err := doSimpleGet(url)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doGet(ctx, url)
+	})
 	if err != nil {
 		return clusterNodes, fmt.Errorf("getting cluster nodes: %w", err)
 	}
@@ -296,11 +384,13 @@ func (r *Robin) GetClusterNodes() (ClusterNodes, error) {
 	return clusterNodes, nil
 }
 
-func (r *Robin) ClusterFix() error {
+func (r *Robin) ClusterFix(ctx context.Context) error {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointClusterFix
 
 	var payload []byte
-	body, err := doPut(url, payload)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doPut(ctx, url, payload)
+	})
 	if err != nil {
 		return fmt.Errorf("cluster fix: %w", err)
 	}
@@ -309,11 +399,13 @@ func (r *Robin) ClusterFix() error {
 	return nil
 }
 
-func (r *Robin) ClusterResetNode(nodeIndex int) error {
+func (r *Robin) ClusterResetNode(ctx context.Context, nodeIndex int) error {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointClusterReset + strconv.Itoa(nodeIndex)
 
 	var payload []byte
-	body, err := doPut(url, payload)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doPut(ctx, url, payload)
+	})
 	if err != nil {
 		return fmt.Errorf("reset node: %w", err)
 	}
@@ -322,7 +414,7 @@ func (r *Robin) ClusterResetNode(nodeIndex int) error {
 	return nil
 }
 
-func (r *Robin) MoveSlots(nodeIndexFrom int, nodeIndexTo int, numSlots int) (bool, error) {
+func (r *Robin) MoveSlots(ctx context.Context, nodeIndexFrom int, nodeIndexTo int, numSlots int) (bool, error) {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointClusterMove
 
 	var moveParam MoveSlots
@@ -334,7 +426,10 @@ func (r *Robin) MoveSlots(nodeIndexFrom int, nodeIndexTo int, numSlots int) (boo
 		return false, fmt.Errorf("moving slots: %w", err)
 	}
 
-	body, err := doPut(url, payload)
+	// MoveSlots is not idempotent — only retry on network-level errors, not on 5xx
+	body, err := r.doWithRetryNetworkOnly(ctx, func() ([]byte, error) {
+		return r.doPut(ctx, url, payload)
+	})
 	if err != nil {
 		return false, fmt.Errorf("moving slots: %w", err)
 	}
@@ -353,11 +448,13 @@ func (r *Robin) MoveSlots(nodeIndexFrom int, nodeIndexTo int, numSlots int) (boo
 	}
 }
 
-func (r *Robin) ClusterRecreate() error {
+func (r *Robin) ClusterRecreate(ctx context.Context) error {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointClusterRecreate
 
 	var payload []byte
-	body, err := doPut(url, payload)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doPut(ctx, url, payload)
+	})
 	if err != nil {
 		return fmt.Errorf("cluster recreate: %w", err)
 	}
@@ -366,10 +463,12 @@ func (r *Robin) ClusterRecreate() error {
 	return nil
 }
 
-func (r *Robin) GetClusterStatus() (string, error) {
+func (r *Robin) GetClusterStatus(ctx context.Context) (string, error) {
 	url := EndpointProtocolPrefix + r.Pod.Status.PodIP + ":" + strconv.Itoa(Port) + EndpointClusterStatus
 
-	body, err := doSimpleGet(url)
+	body, err := r.doWithRetry(ctx, func() ([]byte, error) {
+		return r.doGet(ctx, url)
+	})
 	if err != nil {
 		return "", fmt.Errorf("getting Robin cluster status: %w", err)
 	}
@@ -383,12 +482,13 @@ func (r *Robin) GetClusterStatus() (string, error) {
 	return status.Status, nil
 }
 
-func doSimpleGet(url string) ([]byte, error) {
-	client := &http.Client{
-		Timeout: time.Second * 10,
+func (r *Robin) doGet(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
 	}
 
-	resp, err := client.Get(url)
+	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -398,21 +498,26 @@ func doSimpleGet(url string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return body, &RobinHTTPError{
+			StatusCode: resp.StatusCode,
+			Body:       string(body),
+			URL:        url,
+		}
+	}
+
 	return body, nil
 }
 
-func doPut(url string, payload []byte) ([]byte, error) {
-	client := &http.Client{
-		Timeout: time.Second * 20,
-	}
-
-	req, err := http.NewRequest(http.MethodPut, url, bytes.NewBuffer(payload))
-	req.Header.Set("Content-Type", "application/json")
+func (r *Robin) doPut(ctx context.Context, url string, payload []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewBuffer(payload))
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +527,86 @@ func doPut(url string, payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return body, &RobinHTTPError{
+			StatusCode: resp.StatusCode,
+			Body:       string(body),
+			URL:        url,
+		}
+	}
+
 	return body, nil
+}
+
+func (r *Robin) doWithRetry(ctx context.Context, fn func() ([]byte, error)) ([]byte, error) {
+	var lastBody []byte
+	var lastErr error
+	backoff := wait.Backoff{
+		Steps:    r.config.MaxRetries,
+		Duration: r.config.RetryBackoff,
+		Factor:   2.0,
+		Cap:      5 * time.Second,
+	}
+
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		body, err := fn()
+		if err == nil {
+			lastBody = body
+			return true, nil
+		}
+		if !IsRetryable(err) {
+			return false, err
+		}
+		lastErr = err
+		r.Logger.V(1).Info("Retrying Robin request", "error", err)
+		return false, nil
+	})
+	if err != nil {
+		if wait.Interrupted(err) && lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, err
+	}
+	return lastBody, nil
+}
+
+// doWithRetryNetworkOnly retries only on network-level errors, not on HTTP error responses.
+// Used for non-idempotent operations like MoveSlots where a 5xx may indicate partial completion.
+func (r *Robin) doWithRetryNetworkOnly(ctx context.Context, fn func() ([]byte, error)) ([]byte, error) {
+	var lastBody []byte
+	var lastErr error
+	backoff := wait.Backoff{
+		Steps:    r.config.MaxRetries,
+		Duration: r.config.RetryBackoff,
+		Factor:   2.0,
+		Cap:      5 * time.Second,
+	}
+
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		body, err := fn()
+		if err == nil {
+			lastBody = body
+			return true, nil
+		}
+		// For non-idempotent operations, only retry on pure network errors
+		var httpErr *RobinHTTPError
+		if errors.As(err, &httpErr) {
+			// Got an HTTP response — do not retry (operation may have partially completed)
+			return false, err
+		}
+		// Network-level error — safe to retry
+		lastErr = err
+		r.Logger.V(1).Info("Retrying Robin request (network error)", "error", err)
+		return false, nil
+	})
+	if err != nil {
+		if wait.Interrupted(err) && lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, err
+	}
+	return lastBody, nil
 }
 
 // Compares two configurations, excluding `Redis.Cluster.Status` value.

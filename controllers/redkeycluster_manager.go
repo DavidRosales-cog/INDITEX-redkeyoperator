@@ -58,6 +58,7 @@ func NewRedkeyClusterReconciler(mgr ctrl.Manager, maxConcurrentReconciles int, c
 	reconciler.FindExistingConfigMapFunc = reconciler.DoFindExistingConfigMap
 	reconciler.FindExistingDeploymentFunc = reconciler.DoFindExistingDeployment
 	reconciler.FindExistingPodDisruptionBudgetFunc = reconciler.DoFindExistingPodDisruptionBudget
+	reconciler.NewRobinFunc = robin.NewRobin
 
 	return reconciler
 }
@@ -177,12 +178,12 @@ func (r *RedkeyClusterReconciler) reconcileStatusInitializing(ctx context.Contex
 
 	// Check Robin pod readiness
 	logger := r.getHelperLogger(redkeyCluster.NamespacedName())
-	robin, err := robin.NewRobin(ctx, r.Client, redkeyCluster, logger)
+	robinClient, err := r.NewRobinFunc(ctx, r.Client, redkeyCluster, logger)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting Robin to check its readiness")
 		return true, DefaultRequeueTimeout
 	}
-	flag, err := kubernetes.PodRunningReady(robin.Pod)
+	flag, err := kubernetes.PodRunningReady(robinClient.GetPod())
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error checking Robin pod readiness")
 		return true, DefaultRequeueTimeout
@@ -193,7 +194,7 @@ func (r *RedkeyClusterReconciler) reconcileStatusInitializing(ctx context.Contex
 	}
 
 	// Check Robin is responding to requests
-	status, err := robin.GetStatus()
+	status, err := robinClient.GetStatus(ctx)
 	if err != nil {
 		r.logInfo(redkeyCluster.NamespacedName(), "Waiting for Robin accepting requests")
 		return true, DefaultRequeueTimeout
@@ -211,12 +212,12 @@ func (r *RedkeyClusterReconciler) reconcileStatusConfiguring(ctx context.Context
 
 	// Ask Robin for Redkey cluster readiness
 	logger := r.getHelperLogger((redkeyCluster.NamespacedName()))
-	robinRedis, err := robin.NewRobin(ctx, r.Client, redkeyCluster, logger)
+	robinRedis, err := r.NewRobinFunc(ctx, r.Client, redkeyCluster, logger)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting Robin to check the cluster readiness")
 		return true, DefaultRequeueTimeout
 	}
-	primaries, replicasPerPrimary, err := robinRedis.GetReplicas()
+	primaries, replicasPerPrimary, err := robinRedis.GetReplicas(ctx)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting Robin primaries/replicasPerPrimary")
 		return true, DefaultRequeueTimeout
@@ -226,7 +227,7 @@ func (r *RedkeyClusterReconciler) reconcileStatusConfiguring(ctx context.Context
 	if primaries != int(redkeyCluster.Spec.Primaries) || replicasPerPrimary != int(redkeyCluster.Spec.ReplicasPerPrimary) {
 		r.logInfo(redkeyCluster.NamespacedName(), "Robin nodes count updated", "primaries before", primaries, "primaries after", redkeyCluster.Spec.Primaries,
 			"replicas per primary before", replicasPerPrimary, "replicas per primary after", redkeyCluster.Spec.ReplicasPerPrimary)
-		err = robinRedis.SetReplicas(int(redkeyCluster.Spec.Primaries), int(redkeyCluster.Spec.ReplicasPerPrimary))
+		err = robinRedis.SetReplicas(ctx, int(redkeyCluster.Spec.Primaries), int(redkeyCluster.Spec.ReplicasPerPrimary))
 		if err != nil {
 			r.logError(redkeyCluster.NamespacedName(), err, "Error updating Robin primaries/replicasPerPrimary")
 			return true, DefaultRequeueTimeout
@@ -240,7 +241,7 @@ func (r *RedkeyClusterReconciler) reconcileStatusConfiguring(ctx context.Context
 	}
 
 	// Check cluster readiness.
-	status, err := robinRedis.GetClusterStatus()
+	status, err := robinRedis.GetClusterStatus(ctx)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting cluster status")
 		return true, DefaultRequeueTimeout
@@ -383,18 +384,18 @@ func (r *RedkeyClusterReconciler) reconcileStatusMaintenance(ctx context.Context
 	r.logInfo(redkeyCluster.NamespacedName(), "Redkey cluster in Maintenance mode")
 
 	logger := r.getHelperLogger((redkeyCluster.NamespacedName()))
-	robinRedis, err := robin.NewRobin(ctx, r.Client, redkeyCluster, logger)
+	robinRedis, err := r.NewRobinFunc(ctx, r.Client, redkeyCluster, logger)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting Robin to check the cluster readiness")
 		return true, DefaultRequeueTimeout
 	}
-	status, err := robinRedis.GetStatus()
+	status, err := robinRedis.GetStatus(ctx)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting Robin status")
 		return true, DefaultRequeueTimeout
 	}
 	if status != redkeyv1.RobinStatusMaintenance {
-		err = robinRedis.SetStatus(redkeyv1.RobinStatusMaintenance)
+		err = robinRedis.SetStatus(ctx, redkeyv1.RobinStatusMaintenance)
 		if err != nil {
 			r.logError(redkeyCluster.NamespacedName(), err, "Error setting Robin status to Maintenance")
 			return true, DefaultRequeueTimeout
@@ -413,12 +414,12 @@ func (r *RedkeyClusterReconciler) refreshClusterNodesInfo(ctx context.Context, r
 	}
 
 	logger := r.getHelperLogger((redkeyCluster.NamespacedName()))
-	robin, err := robin.NewRobin(ctx, r.Client, redkeyCluster, logger)
+	robinClient, err := r.NewRobinFunc(ctx, r.Client, redkeyCluster, logger)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting Robin to get cluster nodes")
 		return err
 	}
-	clusterNodes, err := robin.GetClusterNodes()
+	clusterNodes, err := robinClient.GetClusterNodes(ctx)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting cluster nodes from Robin")
 		return err
@@ -574,18 +575,18 @@ func (r *RedkeyClusterReconciler) checkFinalizers(ctx context.Context, redkeyClu
 
 func (r *RedkeyClusterReconciler) checkComingFromMaintenance(ctx context.Context, redkeyCluster *redkeyv1.RedkeyCluster) error {
 	logger := r.getHelperLogger((redkeyCluster.NamespacedName()))
-	robinRedis, err := robin.NewRobin(ctx, r.Client, redkeyCluster, logger)
+	robinRedis, err := r.NewRobinFunc(ctx, r.Client, redkeyCluster, logger)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting Robin to check the cluster readiness")
 		return err
 	}
-	status, err := robinRedis.GetStatus()
+	status, err := robinRedis.GetStatus(ctx)
 	if err != nil {
 		r.logError(redkeyCluster.NamespacedName(), err, "Error getting Robin status")
 		return err
 	}
 	if status == redkeyv1.RobinStatusMaintenance {
-		err = robinRedis.SetStatus(redkeyv1.RobinStatusReady)
+		err = robinRedis.SetStatus(ctx, redkeyv1.RobinStatusReady)
 		if err != nil {
 			r.logError(redkeyCluster.NamespacedName(), err, "Error setting Robin status to Ready")
 			return err

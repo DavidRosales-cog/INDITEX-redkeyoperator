@@ -8,8 +8,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/go-logr/logr"
 	redkeyv1 "github.com/inditextech/redkeyoperator/api/v1"
 	r "github.com/inditextech/redkeyoperator/internal/redis"
+	"github.com/inditextech/redkeyoperator/internal/robin"
 
 	ginkgo "github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/apps/v1"
@@ -58,6 +60,7 @@ func newReconciler(redis *redkeyv1.RedkeyCluster, recorder record.EventRecorder)
 		GetReadyNodesFunc:           mockReadyNodes(make(map[string]*redkeyv1.RedisNode)),
 		FindExistingStatefulSetFunc: mockStatefulSet(newStatefulSet(redis, defaultPrimaries)),
 		FindExistingConfigMapFunc:   mockConfigMap(newConfigMap()),
+		NewRobinFunc:                mockNewRobin(&MockRobinClient{}),
 	}
 
 	return reconciler
@@ -156,4 +159,80 @@ func mockConfigMap(configMap *corev1.ConfigMap) func(ctx context.Context, req ct
 
 func newConfigMap() *corev1.ConfigMap {
 	return &corev1.ConfigMap{}
+}
+
+// MockRobinClient implements robin.RobinClient for testing.
+type MockRobinClient struct {
+	StatusValue        string
+	ClusterStatusValue string
+	Primaries          int
+	ReplicasPerPrimary int
+	ClusterNodesValue  robin.ClusterNodes
+	ClusterCheckOk     bool
+	ClusterCheckErrors []string
+	ClusterCheckWarns  []string
+	MoveSlotsCompleted bool
+	Err                error
+}
+
+func (m *MockRobinClient) GetStatus(ctx context.Context) (string, error) {
+	return m.StatusValue, m.Err
+}
+
+func (m *MockRobinClient) SetStatus(ctx context.Context, status string) error {
+	m.StatusValue = status
+	return m.Err
+}
+
+func (m *MockRobinClient) SetAndPersistRobinStatus(ctx context.Context, client client.Client, redkeyCluster *redkeyv1.RedkeyCluster, newStatus string) error {
+	m.StatusValue = newStatus
+	return m.Err
+}
+
+func (m *MockRobinClient) GetReplicas(ctx context.Context) (int, int, error) {
+	return m.Primaries, m.ReplicasPerPrimary, m.Err
+}
+
+func (m *MockRobinClient) SetReplicas(ctx context.Context, clusterReplicas int, clusterReplicasPerPrimary int) error {
+	m.Primaries = clusterReplicas
+	m.ReplicasPerPrimary = clusterReplicasPerPrimary
+	return m.Err
+}
+
+func (m *MockRobinClient) ClusterCheck(ctx context.Context) (bool, []string, []string, error) {
+	return m.ClusterCheckOk, m.ClusterCheckErrors, m.ClusterCheckWarns, m.Err
+}
+
+func (m *MockRobinClient) GetClusterNodes(ctx context.Context) (robin.ClusterNodes, error) {
+	return m.ClusterNodesValue, m.Err
+}
+
+func (m *MockRobinClient) ClusterFix(ctx context.Context) error {
+	return m.Err
+}
+
+func (m *MockRobinClient) ClusterResetNode(ctx context.Context, nodeIndex int) error {
+	return m.Err
+}
+
+func (m *MockRobinClient) MoveSlots(ctx context.Context, nodeIndexFrom int, nodeIndexTo int, numSlots int) (bool, error) {
+	return m.MoveSlotsCompleted, m.Err
+}
+
+func (m *MockRobinClient) ClusterRecreate(ctx context.Context) error {
+	return m.Err
+}
+
+func (m *MockRobinClient) GetClusterStatus(ctx context.Context) (string, error) {
+	return m.ClusterStatusValue, m.Err
+}
+
+func (m *MockRobinClient) GetPod() *corev1.Pod {
+	return &corev1.Pod{}
+}
+
+func mockNewRobin(mock robin.RobinClient) func(ctx context.Context, client client.Client, redkeyCluster *redkeyv1.RedkeyCluster, logger logr.Logger) (robin.RobinClient, error) {
+	return func(ctx context.Context, client client.Client, redkeyCluster *redkeyv1.RedkeyCluster, logger logr.Logger) (robin.RobinClient, error) {
+		return mock, nil
+	}
 }
